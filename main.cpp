@@ -9,6 +9,7 @@
 
 #include <csignal>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -37,13 +38,14 @@ static uint32_t logical_scr_w = 0;
 static uint32_t logical_scr_h = 0;
 
 /*
- * Measured on the panel: a rendered square appears about 3.8 cm wide
- * and 2.9 cm tall, so the display stretches the X axis by ~1.31x.
- * We compensate by rendering to a wider logical space, then compressing
- * it back to the physical framebuffer during flush.
+ * Final fine-tune after fixing the HDMI/Linux mode handoff. With the
+ * panel now rendering sharply at native timing, the 200 px rulers measure
+ * about 3.96 cm horizontally and 3.70 cm vertically, so only a small
+ * residual X compression is needed.
  */
-static constexpr uint32_t kPixelAspectX = 38;
-static constexpr uint32_t kPixelAspectY = 29;
+static constexpr bool kEnableAspectCorrection = true;
+static constexpr uint32_t kPixelAspectX = 198;
+static constexpr uint32_t kPixelAspectY = 185;
 
 static_assert(LV_COLOR_DEPTH == 16, "This framebuffer backend currently expects LVGL to render RGB565.");
 
@@ -204,10 +206,6 @@ static int logical_y_to_physical(int logical_y) {
     return static_cast<int>((static_cast<int64_t>(logical_y) * fb.vinfo.yres) / logical_scr_h);
 }
 
-static int physical_x_to_logical(int physical_x) {
-    return static_cast<int>(((static_cast<int64_t>(physical_x) * logical_scr_w) + (fb.vinfo.xres / 2)) / fb.vinfo.xres);
-}
-
 static int physical_y_to_logical(int physical_y) {
     return static_cast<int>(((static_cast<int64_t>(physical_y) * logical_scr_h) + (fb.vinfo.yres / 2)) / fb.vinfo.yres);
 }
@@ -241,6 +239,40 @@ static void rgb565_to_rgb888(uint16_t pixel, uint8_t &red, uint8_t &green, uint8
     blue = static_cast<uint8_t>(((pixel & 0x1Fu) * 255u) / 31u);
 }
 
+static uint32_t sample_row_box_filtered(const uint16_t *row, uint32_t src_start_fp, uint32_t src_end_fp) {
+    uint64_t red_acc = 0;
+    uint64_t green_acc = 0;
+    uint64_t blue_acc = 0;
+    uint32_t weight_acc = 0;
+
+    int src_x = static_cast<int>(src_start_fp >> 16);
+    const int src_x_last = static_cast<int>((src_end_fp - 1) >> 16);
+
+    for (; src_x <= src_x_last; src_x++) {
+        const uint32_t pixel_start_fp = static_cast<uint32_t>(src_x) << 16;
+        const uint32_t pixel_end_fp = static_cast<uint32_t>(src_x + 1) << 16;
+        const uint32_t overlap_start = src_start_fp > pixel_start_fp ? src_start_fp : pixel_start_fp;
+        const uint32_t overlap_end = src_end_fp < pixel_end_fp ? src_end_fp : pixel_end_fp;
+        const uint32_t weight = overlap_end - overlap_start;
+
+        uint8_t red = 0;
+        uint8_t green = 0;
+        uint8_t blue = 0;
+        rgb565_to_rgb888(row[src_x], red, green, blue);
+
+        red_acc += static_cast<uint64_t>(red) * weight;
+        green_acc += static_cast<uint64_t>(green) * weight;
+        blue_acc += static_cast<uint64_t>(blue) * weight;
+        weight_acc += weight;
+    }
+
+    const uint8_t red = static_cast<uint8_t>((red_acc + (weight_acc / 2)) / weight_acc);
+    const uint8_t green = static_cast<uint8_t>((green_acc + (weight_acc / 2)) / weight_acc);
+    const uint8_t blue = static_cast<uint8_t>((blue_acc + (weight_acc / 2)) / weight_acc);
+
+    return pack_fb_pixel(red, green, blue);
+}
+
 static void fb_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
     const int area_width = area->x2 - area->x1 + 1;
     const int fb_bytes_per_pixel = fb.vinfo.bits_per_pixel / 8;
@@ -257,18 +289,18 @@ static void fb_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 
     for (int dst_y = dst_y1; dst_y <= dst_y2; dst_y++) {
         const int src_y = physical_y_to_logical(dst_y) - area->y1;
+        const uint16_t *src_row = src + (src_y * area_width);
         uint8_t *dst_row = fb.ptr + (dst_y * fb.finfo.line_length) + (dst_x1 * fb_bytes_per_pixel);
 
         for (int dst_x = dst_x1; dst_x <= dst_x2; dst_x++) {
-            const int src_x = physical_x_to_logical(dst_x) - area->x1;
-            const uint16_t src_pixel = src[src_y * area_width + src_x];
+            const uint32_t src_start_fp =
+                static_cast<uint32_t>(((static_cast<uint64_t>(dst_x) * logical_scr_w) << 16) / fb.vinfo.xres) -
+                (static_cast<uint32_t>(area->x1) << 16);
+            const uint32_t src_end_fp =
+                static_cast<uint32_t>(((static_cast<uint64_t>(dst_x + 1) * logical_scr_w) << 16) / fb.vinfo.xres) -
+                (static_cast<uint32_t>(area->x1) << 16);
 
-            uint8_t red = 0;
-            uint8_t green = 0;
-            uint8_t blue = 0;
-            rgb565_to_rgb888(src_pixel, red, green, blue);
-
-            const uint32_t dst_pixel = pack_fb_pixel(red, green, blue);
+            const uint32_t dst_pixel = sample_row_box_filtered(src_row, src_start_fp, src_end_fp);
             if (fb.vinfo.bits_per_pixel == 32) {
                 reinterpret_cast<uint32_t *>(dst_row)[dst_x - dst_x1] = dst_pixel;
             } else {
@@ -298,7 +330,11 @@ int main() {
 
     const uint32_t scr_w = fb.vinfo.xres;
     const uint32_t scr_h = fb.vinfo.yres;
-    logical_scr_w = static_cast<uint32_t>((static_cast<uint64_t>(scr_w) * kPixelAspectX + (kPixelAspectY / 2)) / kPixelAspectY);
+    if (kEnableAspectCorrection) {
+        logical_scr_w = static_cast<uint32_t>((static_cast<uint64_t>(scr_w) * kPixelAspectX + (kPixelAspectY / 2)) / kPixelAspectY);
+    } else {
+        logical_scr_w = scr_w;
+    }
     logical_scr_h = scr_h;
 
     const int buf_pixels = logical_scr_w * 30;
@@ -318,17 +354,85 @@ int main() {
     lv_display_set_flush_cb(display, fb_flush);
     lv_display_set_buffers(display, buf1, buf2, buf_size, LV_DISPLAY_RENDER_MODE_PARTIAL);
 
-    lv_obj_t *label = lv_label_create(lv_scr_act());
-    lv_label_set_text(label, "Aspect-corrected square test");
-    lv_obj_align(label, LV_ALIGN_TOP_MID, 0, 24);
+    lv_obj_t *screen = lv_scr_act();
+    lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
 
-    lv_obj_t *test_box = lv_obj_create(lv_scr_act());
+    lv_obj_t *title = lv_label_create(screen);
+    lv_label_set_text(title, "Display calibration");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 14);
+
+    char info_text[96];
+    std::snprintf(info_text, sizeof(info_text), "logical %ux%u -> physical %ux%u", logical_scr_w, logical_scr_h, scr_w, scr_h);
+    lv_obj_t *info = lv_label_create(screen);
+    lv_label_set_text(info, info_text);
+    lv_obj_align(info, LV_ALIGN_TOP_MID, 0, 36);
+
+    lv_obj_t *screen_border = lv_obj_create(screen);
+    lv_obj_remove_style_all(screen_border);
+    lv_obj_set_size(screen_border, logical_scr_w - 8, logical_scr_h - 8);
+    lv_obj_set_style_border_width(screen_border, 2, 0);
+    lv_obj_set_style_border_color(screen_border, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(screen_border, LV_OPA_TRANSP, 0);
+    lv_obj_align(screen_border, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_t *test_box = lv_obj_create(screen);
     lv_obj_remove_style_all(test_box);
     lv_obj_set_size(test_box, 160, 160);
     lv_obj_set_style_border_width(test_box, 3, 0);
     lv_obj_set_style_border_color(test_box, lv_color_hex(0xFFFFFF), 0);
     lv_obj_set_style_bg_opa(test_box, LV_OPA_TRANSP, 0);
-    lv_obj_align(test_box, LV_ALIGN_CENTER, 0, 12);
+    lv_obj_align(test_box, LV_ALIGN_CENTER, 0, -8);
+
+    lv_obj_t *h_rule = lv_obj_create(screen);
+    lv_obj_remove_style_all(h_rule);
+    lv_obj_set_size(h_rule, 200, 3);
+    lv_obj_set_style_bg_color(h_rule, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(h_rule, LV_OPA_COVER, 0);
+    lv_obj_align(h_rule, LV_ALIGN_BOTTOM_MID, 0, -44);
+
+    lv_obj_t *h_tick_left = lv_obj_create(screen);
+    lv_obj_remove_style_all(h_tick_left);
+    lv_obj_set_size(h_tick_left, 3, 18);
+    lv_obj_set_style_bg_color(h_tick_left, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(h_tick_left, LV_OPA_COVER, 0);
+    lv_obj_align_to(h_tick_left, h_rule, LV_ALIGN_OUT_LEFT_MID, 0, 0);
+
+    lv_obj_t *h_tick_right = lv_obj_create(screen);
+    lv_obj_remove_style_all(h_tick_right);
+    lv_obj_set_size(h_tick_right, 3, 18);
+    lv_obj_set_style_bg_color(h_tick_right, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(h_tick_right, LV_OPA_COVER, 0);
+    lv_obj_align_to(h_tick_right, h_rule, LV_ALIGN_OUT_RIGHT_MID, 0, 0);
+
+    lv_obj_t *h_label = lv_label_create(screen);
+    lv_label_set_text(h_label, "200 px");
+    lv_obj_align_to(h_label, h_rule, LV_ALIGN_OUT_TOP_MID, 0, -6);
+
+    lv_obj_t *v_rule = lv_obj_create(screen);
+    lv_obj_remove_style_all(v_rule);
+    lv_obj_set_size(v_rule, 3, 200);
+    lv_obj_set_style_bg_color(v_rule, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(v_rule, LV_OPA_COVER, 0);
+    lv_obj_align(v_rule, LV_ALIGN_LEFT_MID, 44, 0);
+
+    lv_obj_t *v_tick_top = lv_obj_create(screen);
+    lv_obj_remove_style_all(v_tick_top);
+    lv_obj_set_size(v_tick_top, 18, 3);
+    lv_obj_set_style_bg_color(v_tick_top, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(v_tick_top, LV_OPA_COVER, 0);
+    lv_obj_align_to(v_tick_top, v_rule, LV_ALIGN_OUT_TOP_MID, 0, 0);
+
+    lv_obj_t *v_tick_bottom = lv_obj_create(screen);
+    lv_obj_remove_style_all(v_tick_bottom);
+    lv_obj_set_size(v_tick_bottom, 18, 3);
+    lv_obj_set_style_bg_color(v_tick_bottom, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(v_tick_bottom, LV_OPA_COVER, 0);
+    lv_obj_align_to(v_tick_bottom, v_rule, LV_ALIGN_OUT_BOTTOM_MID, 0, 0);
+
+    lv_obj_t *v_label = lv_label_create(screen);
+    lv_label_set_text(v_label, "200 px");
+    lv_obj_align_to(v_label, v_rule, LV_ALIGN_OUT_RIGHT_MID, 12, 0);
 
     while (!exit_requested) {
         handle_debug_input();
