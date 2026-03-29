@@ -33,6 +33,17 @@ static int old_kd_mode = KD_TEXT;
 static termios old_termios{};
 static bool old_termios_valid = false;
 static volatile std::sig_atomic_t exit_requested = 0;
+static uint32_t logical_scr_w = 0;
+static uint32_t logical_scr_h = 0;
+
+/*
+ * Measured on the panel: a rendered square appears about 3.8 cm wide
+ * and 2.9 cm tall, so the display stretches the X axis by ~1.31x.
+ * We compensate by rendering to a wider logical space, then compressing
+ * it back to the physical framebuffer during flush.
+ */
+static constexpr uint32_t kPixelAspectX = 38;
+static constexpr uint32_t kPixelAspectY = 29;
 
 static_assert(LV_COLOR_DEPTH == 16, "This framebuffer backend currently expects LVGL to render RGB565.");
 
@@ -185,6 +196,22 @@ static void handle_debug_input() {
     }
 }
 
+static int logical_x_to_physical(int logical_x) {
+    return static_cast<int>((static_cast<int64_t>(logical_x) * fb.vinfo.xres) / logical_scr_w);
+}
+
+static int logical_y_to_physical(int logical_y) {
+    return static_cast<int>((static_cast<int64_t>(logical_y) * fb.vinfo.yres) / logical_scr_h);
+}
+
+static int physical_x_to_logical(int physical_x) {
+    return static_cast<int>(((static_cast<int64_t>(physical_x) * logical_scr_w) + (fb.vinfo.xres / 2)) / fb.vinfo.xres);
+}
+
+static int physical_y_to_logical(int physical_y) {
+    return static_cast<int>(((static_cast<int64_t>(physical_y) * logical_scr_h) + (fb.vinfo.yres / 2)) / fb.vinfo.yres);
+}
+
 static uint32_t scale_8bit_to_channel(uint8_t value, uint32_t bits) {
     if (bits == 0) {
         return 0;
@@ -216,15 +243,25 @@ static void rgb565_to_rgb888(uint16_t pixel, uint8_t &red, uint8_t &green, uint8
 
 static void fb_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
     const int area_width = area->x2 - area->x1 + 1;
-    const int area_height = area->y2 - area->y1 + 1;
     const int fb_bytes_per_pixel = fb.vinfo.bits_per_pixel / 8;
     const auto *src = reinterpret_cast<const uint16_t *>(px_map);
+    const int dst_x1 = logical_x_to_physical(area->x1);
+    const int dst_x2 = logical_x_to_physical(area->x2 + 1) - 1;
+    const int dst_y1 = logical_y_to_physical(area->y1);
+    const int dst_y2 = logical_y_to_physical(area->y2 + 1) - 1;
 
-    for (int row_index = 0; row_index < area_height; row_index++) {
-        uint8_t *dst_row = fb.ptr + ((area->y1 + row_index) * fb.finfo.line_length) + (area->x1 * fb_bytes_per_pixel);
+    if (dst_x1 > dst_x2 || dst_y1 > dst_y2) {
+        lv_display_flush_ready(disp);
+        return;
+    }
 
-        for (int col_index = 0; col_index < area_width; col_index++) {
-            const uint16_t src_pixel = src[row_index * area_width + col_index];
+    for (int dst_y = dst_y1; dst_y <= dst_y2; dst_y++) {
+        const int src_y = physical_y_to_logical(dst_y) - area->y1;
+        uint8_t *dst_row = fb.ptr + (dst_y * fb.finfo.line_length) + (dst_x1 * fb_bytes_per_pixel);
+
+        for (int dst_x = dst_x1; dst_x <= dst_x2; dst_x++) {
+            const int src_x = physical_x_to_logical(dst_x) - area->x1;
+            const uint16_t src_pixel = src[src_y * area_width + src_x];
 
             uint8_t red = 0;
             uint8_t green = 0;
@@ -233,9 +270,9 @@ static void fb_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 
             const uint32_t dst_pixel = pack_fb_pixel(red, green, blue);
             if (fb.vinfo.bits_per_pixel == 32) {
-                reinterpret_cast<uint32_t *>(dst_row)[col_index] = dst_pixel;
+                reinterpret_cast<uint32_t *>(dst_row)[dst_x - dst_x1] = dst_pixel;
             } else {
-                reinterpret_cast<uint16_t *>(dst_row)[col_index] = static_cast<uint16_t>(dst_pixel);
+                reinterpret_cast<uint16_t *>(dst_row)[dst_x - dst_x1] = static_cast<uint16_t>(dst_pixel);
             }
         }
     }
@@ -261,8 +298,10 @@ int main() {
 
     const uint32_t scr_w = fb.vinfo.xres;
     const uint32_t scr_h = fb.vinfo.yres;
+    logical_scr_w = static_cast<uint32_t>((static_cast<uint64_t>(scr_w) * kPixelAspectX + (kPixelAspectY / 2)) / kPixelAspectY);
+    logical_scr_h = scr_h;
 
-    const int buf_pixels = scr_w * 30;
+    const int buf_pixels = logical_scr_w * 30;
     const size_t buf_size = static_cast<size_t>(buf_pixels) * LV_COLOR_FORMAT_GET_SIZE(LV_COLOR_FORMAT_NATIVE);
     buf1 = static_cast<uint8_t *>(std::malloc(buf_size));
     buf2 = static_cast<uint8_t *>(std::malloc(buf_size));
@@ -274,14 +313,22 @@ int main() {
         return 1;
     }
 
-    lv_display_t *display = lv_display_create(scr_w, scr_h);
+    lv_display_t *display = lv_display_create(logical_scr_w, logical_scr_h);
     lv_display_set_color_format(display, LV_COLOR_FORMAT_NATIVE);
     lv_display_set_flush_cb(display, fb_flush);
     lv_display_set_buffers(display, buf1, buf2, buf_size, LV_DISPLAY_RENDER_MODE_PARTIAL);
 
     lv_obj_t *label = lv_label_create(lv_scr_act());
-    lv_label_set_text(label, "Hello LVGL framebuffer!");
-    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_text(label, "Aspect-corrected square test");
+    lv_obj_align(label, LV_ALIGN_TOP_MID, 0, 24);
+
+    lv_obj_t *test_box = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(test_box);
+    lv_obj_set_size(test_box, 160, 160);
+    lv_obj_set_style_border_width(test_box, 3, 0);
+    lv_obj_set_style_border_color(test_box, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(test_box, LV_OPA_TRANSP, 0);
+    lv_obj_align(test_box, LV_ALIGN_CENTER, 0, 12);
 
     while (!exit_requested) {
         handle_debug_input();
