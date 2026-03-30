@@ -1,14 +1,15 @@
 #include <fcntl.h>
-#include <linux/fb.h>
 #include <linux/input.h>
 #include <signal.h>
 #include <sys/kd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/select.h>
 #include <termios.h>
 #include <unistd.h>
 
 #include <csignal>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -16,15 +17,32 @@
 #include <iostream>
 #include <thread>
 
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+
 #include "lv_conf.h"
 #include <lvgl/lvgl.h>
 
+struct DrmBuffer {
+    uint32_t handle = 0;
+    uint32_t pitch = 0;
+    uint32_t fb_id = 0;
+    uint64_t size = 0;
+    uint8_t *map = nullptr;
+};
+
 struct Framebuffer {
     int fd = -1;
-    uint8_t *ptr = nullptr;
-    size_t length = 0;
-    fb_var_screeninfo vinfo{};
-    fb_fix_screeninfo finfo{};
+    drmModeModeInfo mode{};
+    drmModeCrtc *original_crtc = nullptr;
+    uint32_t conn_id = 0;
+    uint32_t crtc_id = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t visible_buffer = 0;
+    uint32_t prepared_buffer = UINT32_MAX;
+    bool page_flip_pending = false;
+    DrmBuffer buffers[2]{};
 };
 
 static Framebuffer fb;
@@ -179,57 +197,274 @@ static void vt_leave_graphics() {
     tty_fd = -1;
 }
 
-static bool fb_init(const char *dev = "/dev/fb0") {
-    fb.fd = open(dev, O_RDWR);
-    if (fb.fd < 0) {
-        std::perror("open framebuffer");
+static bool drm_find_connector_and_mode(drmModeRes *resources, drmModeConnector **out_connector) {
+    for (int index = 0; index < resources->count_connectors; index++) {
+        drmModeConnector *connector = drmModeGetConnector(fb.fd, resources->connectors[index]);
+        if (!connector) {
+            continue;
+        }
+
+        if (connector->connection != DRM_MODE_CONNECTED || connector->count_modes == 0) {
+            drmModeFreeConnector(connector);
+            continue;
+        }
+
+        int preferred_mode = 0;
+        for (int mode_index = 0; mode_index < connector->count_modes; mode_index++) {
+            if (connector->modes[mode_index].type & DRM_MODE_TYPE_PREFERRED) {
+                preferred_mode = mode_index;
+                break;
+            }
+        }
+
+        fb.conn_id = connector->connector_id;
+        fb.mode = connector->modes[preferred_mode];
+        fb.width = fb.mode.hdisplay;
+        fb.height = fb.mode.vdisplay;
+        *out_connector = connector;
+        return true;
+    }
+
+    return false;
+}
+
+static bool drm_find_crtc(drmModeRes *resources, drmModeConnector *connector) {
+    if (connector->encoder_id != 0) {
+        drmModeEncoder *encoder = drmModeGetEncoder(fb.fd, connector->encoder_id);
+        if (encoder) {
+            fb.crtc_id = encoder->crtc_id;
+            drmModeFreeEncoder(encoder);
+            if (fb.crtc_id != 0) {
+                return true;
+            }
+        }
+    }
+
+    for (int enc_index = 0; enc_index < connector->count_encoders; enc_index++) {
+        drmModeEncoder *encoder = drmModeGetEncoder(fb.fd, connector->encoders[enc_index]);
+        if (!encoder) {
+            continue;
+        }
+
+        for (int crtc_index = 0; crtc_index < resources->count_crtcs; crtc_index++) {
+            if ((encoder->possible_crtcs & (1u << crtc_index)) != 0u) {
+                fb.crtc_id = resources->crtcs[crtc_index];
+                drmModeFreeEncoder(encoder);
+                return true;
+            }
+        }
+
+        drmModeFreeEncoder(encoder);
+    }
+
+    return false;
+}
+
+static bool drm_create_buffer(DrmBuffer &buffer) {
+    drm_mode_create_dumb create_request {};
+    create_request.width = fb.width;
+    create_request.height = fb.height;
+    create_request.bpp = 32;
+
+    if (drmIoctl(fb.fd, DRM_IOCTL_MODE_CREATE_DUMB, &create_request) != 0) {
+        std::perror("DRM_IOCTL_MODE_CREATE_DUMB");
         return false;
     }
 
-    if (ioctl(fb.fd, FBIOGET_FSCREENINFO, &fb.finfo)) {
-        std::perror("ioctl FBIOGET_FSCREENINFO");
-        close(fb.fd);
-        fb.fd = -1;
-        return false;
-    }
-    if (ioctl(fb.fd, FBIOGET_VSCREENINFO, &fb.vinfo)) {
-        std::perror("ioctl FBIOGET_VSCREENINFO");
-        close(fb.fd);
-        fb.fd = -1;
+    buffer.handle = create_request.handle;
+    buffer.pitch = create_request.pitch;
+    buffer.size = create_request.size;
+
+    if (drmModeAddFB(fb.fd, fb.width, fb.height, 24, 32, buffer.pitch, buffer.handle, &buffer.fb_id) != 0) {
+        std::perror("drmModeAddFB");
         return false;
     }
 
-    fb.length = fb.finfo.smem_len;
-    fb.ptr = static_cast<uint8_t *>(mmap(nullptr, fb.length, PROT_READ | PROT_WRITE, MAP_SHARED, fb.fd, 0));
-    if (fb.ptr == MAP_FAILED) {
-        std::perror("mmap framebuffer");
-        fb.ptr = nullptr;
-        close(fb.fd);
-        fb.fd = -1;
+    drm_mode_map_dumb map_request {};
+    map_request.handle = buffer.handle;
+    if (drmIoctl(fb.fd, DRM_IOCTL_MODE_MAP_DUMB, &map_request) != 0) {
+        std::perror("DRM_IOCTL_MODE_MAP_DUMB");
         return false;
     }
 
-    if (fb.vinfo.bits_per_pixel != 32 && fb.vinfo.bits_per_pixel != 16) {
-        std::cerr << "Unsupported framebuffer bpp: " << fb.vinfo.bits_per_pixel << " (only 16/32 supported).\n";
-        munmap(fb.ptr, fb.length);
-        close(fb.fd);
-        fb.fd = -1;
-        fb.ptr = nullptr;
+    buffer.map = static_cast<uint8_t *>(mmap(nullptr, buffer.size, PROT_READ | PROT_WRITE, MAP_SHARED, fb.fd, map_request.offset));
+    if (buffer.map == MAP_FAILED) {
+        std::perror("mmap DRM dumb buffer");
+        buffer.map = nullptr;
         return false;
+    }
+
+    std::memset(buffer.map, 0, buffer.size);
+    return true;
+}
+
+static void drm_destroy_buffer(DrmBuffer &buffer) {
+    if (buffer.map) {
+        munmap(buffer.map, buffer.size);
+        buffer.map = nullptr;
+    }
+
+    if (buffer.fb_id != 0) {
+        drmModeRmFB(fb.fd, buffer.fb_id);
+        buffer.fb_id = 0;
+    }
+
+    if (buffer.handle != 0) {
+        drm_mode_destroy_dumb destroy_request {};
+        destroy_request.handle = buffer.handle;
+        drmIoctl(fb.fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_request);
+        buffer.handle = 0;
+    }
+
+    buffer.pitch = 0;
+    buffer.size = 0;
+}
+
+static void drm_page_flip_handler(int, unsigned int, unsigned int, unsigned int, void *) {
+    fb.page_flip_pending = false;
+}
+
+static bool drm_wait_for_page_flip() {
+    drmEventContext event_context {};
+    event_context.version = DRM_EVENT_CONTEXT_VERSION;
+    event_context.page_flip_handler = drm_page_flip_handler;
+
+    while (fb.page_flip_pending) {
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(fb.fd, &read_fds);
+
+        if (select(fb.fd + 1, &read_fds, nullptr, nullptr, nullptr) < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            std::perror("select DRM page flip");
+            fb.page_flip_pending = false;
+            return false;
+        }
+
+        if (drmHandleEvent(fb.fd, &event_context) != 0) {
+            std::perror("drmHandleEvent");
+            fb.page_flip_pending = false;
+            return false;
+        }
     }
 
     return true;
 }
 
-static void fb_deinit() {
-    if (fb.ptr) {
-        munmap(fb.ptr, fb.length);
-        fb.ptr = nullptr;
+static bool fb_init(const char *dev = "/dev/dri/card0") {
+    fb.fd = open(dev, O_RDWR | O_CLOEXEC);
+    if (fb.fd < 0) {
+        std::perror("open DRM device");
+        return false;
     }
+
+    drmModeRes *resources = drmModeGetResources(fb.fd);
+    if (!resources) {
+        std::perror("drmModeGetResources");
+        close(fb.fd);
+        fb.fd = -1;
+        return false;
+    }
+
+    drmModeConnector *connector = nullptr;
+    if (!drm_find_connector_and_mode(resources, &connector) || !drm_find_crtc(resources, connector)) {
+        std::cerr << "Failed to find a connected DRM connector/CRTC.\n";
+        if (connector) {
+            drmModeFreeConnector(connector);
+        }
+        drmModeFreeResources(resources);
+        close(fb.fd);
+        fb.fd = -1;
+        return false;
+    }
+
+    fb.original_crtc = drmModeGetCrtc(fb.fd, fb.crtc_id);
+    if (!fb.original_crtc) {
+        std::perror("drmModeGetCrtc");
+        drmModeFreeConnector(connector);
+        drmModeFreeResources(resources);
+        close(fb.fd);
+        fb.fd = -1;
+        return false;
+    }
+
+    const bool buffer_ok = drm_create_buffer(fb.buffers[0]) && drm_create_buffer(fb.buffers[1]);
+    if (!buffer_ok) {
+        drm_destroy_buffer(fb.buffers[1]);
+        drm_destroy_buffer(fb.buffers[0]);
+        drmModeFreeCrtc(fb.original_crtc);
+        fb.original_crtc = nullptr;
+        drmModeFreeConnector(connector);
+        drmModeFreeResources(resources);
+        close(fb.fd);
+        fb.fd = -1;
+        return false;
+    }
+
+    if (drmModeSetCrtc(fb.fd, fb.crtc_id, fb.buffers[0].fb_id, 0, 0, &fb.conn_id, 1, &fb.mode) != 0) {
+        std::perror("drmModeSetCrtc");
+        drm_destroy_buffer(fb.buffers[1]);
+        drm_destroy_buffer(fb.buffers[0]);
+        drmModeFreeCrtc(fb.original_crtc);
+        fb.original_crtc = nullptr;
+        drmModeFreeConnector(connector);
+        drmModeFreeResources(resources);
+        close(fb.fd);
+        fb.fd = -1;
+        return false;
+    }
+
+    fb.visible_buffer = 0;
+    fb.prepared_buffer = UINT32_MAX;
+
+    drmModeFreeConnector(connector);
+    drmModeFreeResources(resources);
+    return true;
+}
+
+static void fb_deinit() {
+    if (fb.fd >= 0 && fb.original_crtc) {
+        drmModeSetCrtc(
+            fb.fd,
+            fb.original_crtc->crtc_id,
+            fb.original_crtc->buffer_id,
+            fb.original_crtc->x,
+            fb.original_crtc->y,
+            &fb.conn_id,
+            1,
+            &fb.original_crtc->mode);
+    }
+
+    drm_destroy_buffer(fb.buffers[1]);
+    drm_destroy_buffer(fb.buffers[0]);
+
+    if (fb.original_crtc) {
+        drmModeFreeCrtc(fb.original_crtc);
+        fb.original_crtc = nullptr;
+    }
+
     if (fb.fd >= 0) {
         close(fb.fd);
         fb.fd = -1;
     }
+}
+
+static bool fb_present_buffer(uint32_t buffer_index) {
+    fb.page_flip_pending = true;
+    if (drmModePageFlip(fb.fd, fb.crtc_id, fb.buffers[buffer_index].fb_id, DRM_MODE_PAGE_FLIP_EVENT, nullptr) != 0) {
+        std::perror("drmModePageFlip");
+        fb.page_flip_pending = false;
+        return false;
+    }
+
+    if (!drm_wait_for_page_flip()) {
+        return false;
+    }
+
+    fb.visible_buffer = buffer_index;
+    return true;
 }
 
 static void app_cleanup() {
@@ -254,16 +489,25 @@ static void handle_debug_input() {
     }
 }
 
+static void sync_touch_visual() {
+    if (!root_screen || bg_pressed_visual == ts.pressed) {
+        return;
+    }
+
+    bg_pressed_visual = ts.pressed;
+    lv_obj_set_style_bg_color(root_screen, bg_pressed_visual ? lv_color_hex(0x404060) : lv_color_hex(0x000000), 0);
+}
+
 static int logical_x_to_physical(int logical_x) {
-    return static_cast<int>((static_cast<int64_t>(logical_x) * fb.vinfo.xres) / logical_scr_w);
+    return static_cast<int>((static_cast<int64_t>(logical_x) * fb.width) / logical_scr_w);
 }
 
 static int logical_y_to_physical(int logical_y) {
-    return static_cast<int>((static_cast<int64_t>(logical_y) * fb.vinfo.yres) / logical_scr_h);
+    return static_cast<int>((static_cast<int64_t>(logical_y) * fb.height) / logical_scr_h);
 }
 
 static int physical_y_to_logical(int physical_y) {
-    return static_cast<int>(((static_cast<int64_t>(physical_y) * logical_scr_h) + (fb.vinfo.yres / 2)) / fb.vinfo.yres);
+    return static_cast<int>(((static_cast<int64_t>(physical_y) * logical_scr_h) + (fb.height / 2)) / fb.height);
 }
 
 static int scale_touch_axis(int value, int min_value, int max_value, int out_max, bool invert_axis) {
@@ -315,13 +559,11 @@ static void touch_poll() {
 }
 
 static void touch_read(lv_indev_t *, lv_indev_data_t *data) {
-    touch_poll();
-
     data->state = ts.pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
 
     if (ts.has_x && ts.has_y) {
-        int physical_x = scale_touch_axis(ts.raw_x, ts.min_x, ts.max_x, static_cast<int>(fb.vinfo.xres) - 1, ts.invert_x);
-        int physical_y = scale_touch_axis(ts.raw_y, ts.min_y, ts.max_y, static_cast<int>(fb.vinfo.yres) - 1, ts.invert_y);
+        int physical_x = scale_touch_axis(ts.raw_x, ts.min_x, ts.max_x, static_cast<int>(fb.width) - 1, ts.invert_x);
+        int physical_y = scale_touch_axis(ts.raw_y, ts.min_y, ts.max_y, static_cast<int>(fb.height) - 1, ts.invert_y);
 
         if (ts.swap_xy) {
             const int tmp = physical_x;
@@ -329,35 +571,19 @@ static void touch_read(lv_indev_t *, lv_indev_data_t *data) {
             physical_y = tmp;
         }
 
-        data->point.x = static_cast<lv_coord_t>((static_cast<int64_t>(physical_x) * logical_scr_w) / fb.vinfo.xres);
-        data->point.y = static_cast<lv_coord_t>((static_cast<int64_t>(physical_y) * logical_scr_h) / fb.vinfo.yres);
+        data->point.x = static_cast<lv_coord_t>((static_cast<int64_t>(physical_x) * logical_scr_w) / fb.width);
+        data->point.y = static_cast<lv_coord_t>((static_cast<int64_t>(physical_y) * logical_scr_h) / fb.height);
     } else {
         data->point.x = 0;
         data->point.y = 0;
     }
 }
 
-static uint32_t scale_8bit_to_channel(uint8_t value, uint32_t bits) {
-    if (bits == 0) {
-        return 0;
-    }
-
-    const uint32_t max_value = (1u << bits) - 1u;
-    return (static_cast<uint32_t>(value) * max_value + 127u) / 255u;
-}
-
 static uint32_t pack_fb_pixel(uint8_t red, uint8_t green, uint8_t blue) {
-    uint32_t pixel = 0;
-
-    pixel |= scale_8bit_to_channel(red, fb.vinfo.red.length) << fb.vinfo.red.offset;
-    pixel |= scale_8bit_to_channel(green, fb.vinfo.green.length) << fb.vinfo.green.offset;
-    pixel |= scale_8bit_to_channel(blue, fb.vinfo.blue.length) << fb.vinfo.blue.offset;
-
-    if (fb.vinfo.transp.length != 0) {
-        pixel |= ((1u << fb.vinfo.transp.length) - 1u) << fb.vinfo.transp.offset;
-    }
-
-    return pixel;
+    return 0xFF000000u |
+           (static_cast<uint32_t>(red) << 16) |
+           (static_cast<uint32_t>(green) << 8) |
+           static_cast<uint32_t>(blue);
 }
 
 static void rgb565_to_rgb888(uint16_t pixel, uint8_t &red, uint8_t &green, uint8_t &blue) {
@@ -401,8 +627,8 @@ static uint32_t sample_row_box_filtered(const uint16_t *row, uint32_t src_start_
 }
 
 static void fb_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
-    const int area_width = area->x2 - area->x1 + 1;
-    const int fb_bytes_per_pixel = fb.vinfo.bits_per_pixel / 8;
+    const bool is_last_flush = lv_display_flush_is_last(disp);
+    const int fb_bytes_per_pixel = 4;
     const auto *src = reinterpret_cast<const uint16_t *>(px_map);
     const int dst_x1 = logical_x_to_physical(area->x1);
     const int dst_x2 = logical_x_to_physical(area->x2 + 1) - 1;
@@ -414,26 +640,30 @@ static void fb_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
         return;
     }
 
+    const uint32_t draw_buffer = 1u - fb.visible_buffer;
+    DrmBuffer &back_buffer = fb.buffers[draw_buffer];
+
+    if (fb.prepared_buffer != draw_buffer) {
+        std::memcpy(back_buffer.map, fb.buffers[fb.visible_buffer].map, fb.buffers[fb.visible_buffer].size);
+        fb.prepared_buffer = draw_buffer;
+    }
+
     for (int dst_y = dst_y1; dst_y <= dst_y2; dst_y++) {
-        const int src_y = physical_y_to_logical(dst_y) - area->y1;
-        const uint16_t *src_row = src + (src_y * area_width);
-        uint8_t *dst_row = fb.ptr + (dst_y * fb.finfo.line_length) + (dst_x1 * fb_bytes_per_pixel);
+        const int src_y = physical_y_to_logical(dst_y);
+        const uint16_t *src_row = src + (static_cast<size_t>(src_y) * logical_scr_w);
+        uint8_t *dst_row = back_buffer.map + (static_cast<size_t>(dst_y) * back_buffer.pitch) + (dst_x1 * fb_bytes_per_pixel);
 
         for (int dst_x = dst_x1; dst_x <= dst_x2; dst_x++) {
-            const uint32_t src_start_fp =
-                static_cast<uint32_t>(((static_cast<uint64_t>(dst_x) * logical_scr_w) << 16) / fb.vinfo.xres) -
-                (static_cast<uint32_t>(area->x1) << 16);
-            const uint32_t src_end_fp =
-                static_cast<uint32_t>(((static_cast<uint64_t>(dst_x + 1) * logical_scr_w) << 16) / fb.vinfo.xres) -
-                (static_cast<uint32_t>(area->x1) << 16);
+            const uint32_t src_start_fp = static_cast<uint32_t>(((static_cast<uint64_t>(dst_x) * logical_scr_w) << 16) / fb.width);
+            const uint32_t src_end_fp = static_cast<uint32_t>(((static_cast<uint64_t>(dst_x + 1) * logical_scr_w) << 16) / fb.width);
 
             const uint32_t dst_pixel = sample_row_box_filtered(src_row, src_start_fp, src_end_fp);
-            if (fb.vinfo.bits_per_pixel == 32) {
-                reinterpret_cast<uint32_t *>(dst_row)[dst_x - dst_x1] = dst_pixel;
-            } else {
-                reinterpret_cast<uint16_t *>(dst_row)[dst_x - dst_x1] = static_cast<uint16_t>(dst_pixel);
-            }
+            reinterpret_cast<uint32_t *>(dst_row)[dst_x - dst_x1] = dst_pixel;
         }
+    }
+
+    if (is_last_flush) {
+        fb_present_buffer(draw_buffer);
     }
 
     lv_display_flush_ready(disp);
@@ -455,8 +685,8 @@ int main() {
 
     lv_init();
 
-    const uint32_t scr_w = fb.vinfo.xres;
-    const uint32_t scr_h = fb.vinfo.yres;
+    const uint32_t scr_w = fb.width;
+    const uint32_t scr_h = fb.height;
     if (kEnableAspectCorrection) {
         logical_scr_w = static_cast<uint32_t>((static_cast<uint64_t>(scr_w) * kPixelAspectX + (kPixelAspectY / 2)) / kPixelAspectY);
     } else {
@@ -464,7 +694,7 @@ int main() {
     }
     logical_scr_h = scr_h;
 
-    const int buf_pixels = logical_scr_w * 30;
+    const int buf_pixels = logical_scr_w * logical_scr_h;
     const size_t buf_size = static_cast<size_t>(buf_pixels) * LV_COLOR_FORMAT_GET_SIZE(LV_COLOR_FORMAT_NATIVE);
     buf1 = static_cast<uint8_t *>(std::malloc(buf_size));
     buf2 = static_cast<uint8_t *>(std::malloc(buf_size));
@@ -479,7 +709,7 @@ int main() {
     lv_display_t *display = lv_display_create(logical_scr_w, logical_scr_h);
     lv_display_set_color_format(display, LV_COLOR_FORMAT_NATIVE);
     lv_display_set_flush_cb(display, fb_flush);
-    lv_display_set_buffers(display, buf1, buf2, buf_size, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_buffers(display, buf1, buf2, buf_size, LV_DISPLAY_RENDER_MODE_DIRECT);
 
     if (touch_init()) {
         lv_indev_t *touch_indev = lv_indev_create();
@@ -569,17 +799,22 @@ int main() {
     lv_label_set_text(v_label, "200 px");
     lv_obj_align_to(v_label, v_rule, LV_ALIGN_OUT_RIGHT_MID, 12, 0);
 
+    auto last_tick = std::chrono::steady_clock::now();
+
     while (!exit_requested) {
         handle_debug_input();
-        lv_tick_inc(10);
-        lv_timer_handler();
+        touch_poll();
+        sync_touch_visual();
 
-        if (root_screen && bg_pressed_visual != ts.pressed) {
-            bg_pressed_visual = ts.pressed;
-            lv_obj_set_style_bg_color(root_screen, bg_pressed_visual ? lv_color_hex(0x404060) : lv_color_hex(0x000000), 0);
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_tick).count();
+        if (elapsed_ms > 0) {
+            lv_tick_inc(static_cast<uint32_t>(elapsed_ms));
+            last_tick = now;
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        lv_timer_handler();
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 
     return 0;

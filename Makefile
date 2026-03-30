@@ -1,10 +1,13 @@
 CXX := g++
 CC := gcc
 
-COMMONFLAGS := -O2 -Wall -Wextra -I/root/src/ -I/root/speedometer
+DRM_CFLAGS := $(shell pkg-config --cflags libdrm)
+DRM_LIBS := $(shell pkg-config --libs libdrm)
+
+COMMONFLAGS := -O2 -Wall -Wextra -I/root/src/ -I/root/speedometer $(DRM_CFLAGS)
 CXXFLAGS := -std=c++17 $(COMMONFLAGS)
 CFLAGS := -std=gnu11 $(COMMONFLAGS)
-LDLIBS := -lpthread -lm
+LDLIBS := -lpthread -lm $(DRM_LIBS)
 
 TARGET := hello_rpi
 SRC := main.cpp
@@ -16,7 +19,7 @@ MAIN_OBJ := $(BUILD_DIR)/main.o
 LVGL_OBJ := $(patsubst $(LVGL_DIR)/src/%.c,$(BUILD_DIR)/lvgl/%.o,$(LVGL_SRC))
 OBJ := $(MAIN_OBJ) $(LVGL_OBJ)
 
-.PHONY: all clean run
+.PHONY: all clean run compdb
 
 all: $(TARGET)
 
@@ -34,5 +37,20 @@ $(BUILD_DIR)/lvgl/%.o: $(LVGL_DIR)/src/%.c
 run: $(TARGET)
 	./$(TARGET)
 
+compile_commands.json: Makefile
+	printf '[\n' > $@
+	first=1; \
+	main_cmd='$(CXX) $(CXXFLAGS) -c $(SRC) -o $(MAIN_OBJ)'; \
+	printf '  {"directory":"%s","file":"%s","command":"%s"}' "$(CURDIR)" "$(CURDIR)/$(SRC)" "$$main_cmd" >> $@; \
+	for src in $(LVGL_SRC); do \
+		rel_path=$${src#$(LVGL_DIR)/src/}; \
+		obj_path="$(BUILD_DIR)/lvgl/$${rel_path%.c}.o"; \
+		cmd='$(CC) $(CFLAGS) -c '"$$src"' -o '"$$obj_path"; \
+		printf ',\n  {"directory":"%s","file":"%s","command":"%s"}' "$(CURDIR)" "$$src" "$$cmd" >> $@; \
+	done; \
+	printf '\n]\n' >> $@
+
+compdb: compile_commands.json
+
 clean:
-	rm -rf $(BUILD_DIR) $(TARGET)
+	rm -rf $(BUILD_DIR) $(TARGET) compile_commands.json
