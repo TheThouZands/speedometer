@@ -56,10 +56,20 @@ static volatile std::sig_atomic_t exit_requested = 0;
 static uint32_t logical_scr_w = 0;
 static uint32_t logical_scr_h = 0;
 static lv_obj_t *root_screen = nullptr;
-static lv_obj_t *touch_crosshair_h = nullptr;
-static lv_obj_t *touch_crosshair_v = nullptr;
-static lv_obj_t *touch_crosshair_dot = nullptr;
 static bool bg_pressed_visual = false;
+static constexpr int kMaxTouchSlots = 5;
+static lv_obj_t *touch_crosshair_h[kMaxTouchSlots] = {};
+static lv_obj_t *touch_crosshair_v[kMaxTouchSlots] = {};
+static lv_obj_t *touch_crosshair_dot[kMaxTouchSlots] = {};
+
+struct TouchSlot {
+    int raw_x = 0;
+    int raw_y = 0;
+    int tracking_id = -1;
+    bool active = false;
+    bool has_x = false;
+    bool has_y = false;
+};
 
 struct Touchscreen {
     int fd = -1;
@@ -67,14 +77,13 @@ struct Touchscreen {
     int max_x = 4095;
     int min_y = 0;
     int max_y = 4095;
-    int raw_x = 0;
-    int raw_y = 0;
+    int current_slot = 0;
     bool pressed = false;
-    bool has_x = false;
-    bool has_y = false;
+    bool has_mt = false;
     bool invert_x = false;
     bool invert_y = false;
     bool swap_xy = false;
+    TouchSlot slots[kMaxTouchSlots]{};
 };
 
 static Touchscreen ts;
@@ -155,18 +164,20 @@ static bool touch_init(const char *dev = "/dev/input/event0") {
     }
 
     input_absinfo absinfo {};
-    if (ioctl(ts.fd, EVIOCGABS(ABS_X), &absinfo) == 0) {
+    if (ioctl(ts.fd, EVIOCGABS(ABS_MT_POSITION_X), &absinfo) == 0) {
         ts.min_x = absinfo.minimum;
         ts.max_x = absinfo.maximum;
-    } else if (ioctl(ts.fd, EVIOCGABS(ABS_MT_POSITION_X), &absinfo) == 0) {
+        ts.has_mt = true;
+    } else if (ioctl(ts.fd, EVIOCGABS(ABS_X), &absinfo) == 0) {
         ts.min_x = absinfo.minimum;
         ts.max_x = absinfo.maximum;
     }
 
-    if (ioctl(ts.fd, EVIOCGABS(ABS_Y), &absinfo) == 0) {
+    if (ioctl(ts.fd, EVIOCGABS(ABS_MT_POSITION_Y), &absinfo) == 0) {
         ts.min_y = absinfo.minimum;
         ts.max_y = absinfo.maximum;
-    } else if (ioctl(ts.fd, EVIOCGABS(ABS_MT_POSITION_Y), &absinfo) == 0) {
+        ts.has_mt = true;
+    } else if (ioctl(ts.fd, EVIOCGABS(ABS_Y), &absinfo) == 0) {
         ts.min_y = absinfo.minimum;
         ts.max_y = absinfo.maximum;
     }
@@ -533,64 +544,38 @@ static int scale_touch_axis(int value, int min_value, int max_value, int out_max
     return result;
 }
 
-static void touch_poll() {
-    if (ts.fd < 0) {
-        return;
-    }
-
-    input_event ev {};
-    while (read(ts.fd, &ev, sizeof(ev)) == static_cast<ssize_t>(sizeof(ev))) {
-        if (ev.type == EV_KEY && ev.code == BTN_TOUCH) {
-            ts.pressed = (ev.value != 0);
-        } else if (ev.type == EV_ABS) {
-            switch (ev.code) {
-            case ABS_X:
-            case ABS_MT_POSITION_X:
-                ts.raw_x = ev.value;
-                ts.has_x = true;
-                break;
-            case ABS_Y:
-            case ABS_MT_POSITION_Y:
-                ts.raw_y = ev.value;
-                ts.has_y = true;
-                break;
-            default:
-                break;
-            }
+static bool touch_any_active() {
+    for (int slot_index = 0; slot_index < kMaxTouchSlots; slot_index++) {
+        if (ts.slots[slot_index].active) {
+            return true;
         }
     }
+
+    return false;
 }
 
-static void touch_read(lv_indev_t *, lv_indev_data_t *data) {
-    data->state = ts.pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
-
-    lv_point_t point {};
-    if (ts.has_x && ts.has_y) {
-        int physical_x = scale_touch_axis(ts.raw_x, ts.min_x, ts.max_x, static_cast<int>(fb.width) - 1, ts.invert_x);
-        int physical_y = scale_touch_axis(ts.raw_y, ts.min_y, ts.max_y, static_cast<int>(fb.height) - 1, ts.invert_y);
-
-        if (ts.swap_xy) {
-            const int tmp = physical_x;
-            physical_x = physical_y;
-            physical_y = tmp;
+static int touch_first_active_slot() {
+    for (int slot_index = 0; slot_index < kMaxTouchSlots; slot_index++) {
+        if (ts.slots[slot_index].active && ts.slots[slot_index].has_x && ts.slots[slot_index].has_y) {
+            return slot_index;
         }
-
-        point.x = static_cast<lv_coord_t>((static_cast<int64_t>(physical_x) * logical_scr_w) / fb.width);
-        point.y = static_cast<lv_coord_t>((static_cast<int64_t>(physical_y) * logical_scr_h) / fb.height);
-        data->point = point;
-    } else {
-        data->point.x = 0;
-        data->point.y = 0;
     }
+
+    return -1;
 }
 
-static bool touch_get_logical_point(lv_point_t *point) {
-    if (!point || !ts.pressed || !ts.has_x || !ts.has_y) {
+static bool touch_slot_get_logical_point(int slot_index, lv_point_t *point) {
+    if (!point || slot_index < 0 || slot_index >= kMaxTouchSlots) {
         return false;
     }
 
-    int physical_x = scale_touch_axis(ts.raw_x, ts.min_x, ts.max_x, static_cast<int>(fb.width) - 1, ts.invert_x);
-    int physical_y = scale_touch_axis(ts.raw_y, ts.min_y, ts.max_y, static_cast<int>(fb.height) - 1, ts.invert_y);
+    const TouchSlot &slot = ts.slots[slot_index];
+    if (!slot.active || !slot.has_x || !slot.has_y) {
+        return false;
+    }
+
+    int physical_x = scale_touch_axis(slot.raw_x, ts.min_x, ts.max_x, static_cast<int>(fb.width) - 1, ts.invert_x);
+    int physical_y = scale_touch_axis(slot.raw_y, ts.min_y, ts.max_y, static_cast<int>(fb.height) - 1, ts.invert_y);
 
     if (ts.swap_xy) {
         const int tmp = physical_x;
@@ -603,30 +588,111 @@ static bool touch_get_logical_point(lv_point_t *point) {
     return true;
 }
 
-static void update_touch_crosshair() {
-    if (!touch_crosshair_h || !touch_crosshair_v || !touch_crosshair_dot) {
+static void touch_poll() {
+    if (ts.fd < 0) {
         return;
     }
+
+    input_event ev {};
+    while (read(ts.fd, &ev, sizeof(ev)) == static_cast<ssize_t>(sizeof(ev))) {
+        if (ev.type == EV_KEY && ev.code == BTN_TOUCH) {
+            if (!ts.has_mt) {
+                ts.slots[0].active = (ev.value != 0);
+                if (!ts.slots[0].active) {
+                    ts.slots[0].tracking_id = -1;
+                }
+            }
+        } else if (ev.type == EV_ABS) {
+            switch (ev.code) {
+            case ABS_X:
+                ts.slots[0].raw_x = ev.value;
+                ts.slots[0].has_x = true;
+                break;
+            case ABS_Y:
+                ts.slots[0].raw_y = ev.value;
+                ts.slots[0].has_y = true;
+                break;
+            case ABS_MT_SLOT:
+                if (ev.value >= 0 && ev.value < kMaxTouchSlots) {
+                    ts.current_slot = ev.value;
+                }
+                break;
+            case ABS_MT_TRACKING_ID:
+                if (ev.value < 0) {
+                    ts.slots[ts.current_slot].active = false;
+                    ts.slots[ts.current_slot].tracking_id = -1;
+                } else {
+                    ts.slots[ts.current_slot].active = true;
+                    ts.slots[ts.current_slot].tracking_id = ev.value;
+                }
+                break;
+            case ABS_MT_POSITION_X:
+                ts.slots[ts.current_slot].raw_x = ev.value;
+                ts.slots[ts.current_slot].has_x = true;
+                break;
+            case ABS_MT_POSITION_Y:
+                ts.slots[ts.current_slot].raw_y = ev.value;
+                ts.slots[ts.current_slot].has_y = true;
+                break;
+            default:
+                break;
+            }
+        }
+    }
+
+    ts.pressed = touch_any_active();
+}
+
+static void touch_read(lv_indev_t *, lv_indev_data_t *data) {
+    const int primary_slot = touch_first_active_slot();
+    data->state = primary_slot >= 0 ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
 
     lv_point_t point {};
-    if (!touch_get_logical_point(&point)) {
-        lv_obj_add_flag(touch_crosshair_h, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(touch_crosshair_v, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(touch_crosshair_dot, LV_OBJ_FLAG_HIDDEN);
-        return;
+    if (touch_slot_get_logical_point(primary_slot, &point)) {
+        data->point = point;
+    } else {
+        data->point.x = 0;
+        data->point.y = 0;
     }
+}
 
+static void update_touch_crosshair() {
     static constexpr lv_coord_t crosshair_span = 28;
     static constexpr lv_coord_t crosshair_thickness = 3;
     static constexpr lv_coord_t dot_size = 7;
+    static constexpr uint32_t touch_colors[kMaxTouchSlots] = {
+        0xFF4040,
+        0x40FF40,
+        0x40A0FF,
+        0xFFD040,
+        0xFF40FF
+    };
 
-    lv_obj_clear_flag(touch_crosshair_h, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(touch_crosshair_v, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(touch_crosshair_dot, LV_OBJ_FLAG_HIDDEN);
+    for (int slot_index = 0; slot_index < kMaxTouchSlots; slot_index++) {
+        if (!touch_crosshair_h[slot_index] || !touch_crosshair_v[slot_index] || !touch_crosshair_dot[slot_index]) {
+            continue;
+        }
 
-    lv_obj_set_pos(touch_crosshair_h, point.x - (crosshair_span / 2), point.y - (crosshair_thickness / 2));
-    lv_obj_set_pos(touch_crosshair_v, point.x - (crosshair_thickness / 2), point.y - (crosshair_span / 2));
-    lv_obj_set_pos(touch_crosshair_dot, point.x - (dot_size / 2), point.y - (dot_size / 2));
+        lv_point_t point {};
+        if (!touch_slot_get_logical_point(slot_index, &point)) {
+            lv_obj_add_flag(touch_crosshair_h[slot_index], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(touch_crosshair_v[slot_index], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(touch_crosshair_dot[slot_index], LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+
+        lv_obj_set_style_bg_color(touch_crosshair_h[slot_index], lv_color_hex(touch_colors[slot_index]), 0);
+        lv_obj_set_style_bg_color(touch_crosshair_v[slot_index], lv_color_hex(touch_colors[slot_index]), 0);
+        lv_obj_set_style_bg_color(touch_crosshair_dot[slot_index], lv_color_hex(touch_colors[slot_index]), 0);
+
+        lv_obj_clear_flag(touch_crosshair_h[slot_index], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(touch_crosshair_v[slot_index], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(touch_crosshair_dot[slot_index], LV_OBJ_FLAG_HIDDEN);
+
+        lv_obj_set_pos(touch_crosshair_h[slot_index], point.x - (crosshair_span / 2), point.y - (crosshair_thickness / 2));
+        lv_obj_set_pos(touch_crosshair_v[slot_index], point.x - (crosshair_thickness / 2), point.y - (crosshair_span / 2));
+        lv_obj_set_pos(touch_crosshair_dot[slot_index], point.x - (dot_size / 2), point.y - (dot_size / 2));
+    }
 }
 
 static uint32_t pack_fb_pixel(uint8_t red, uint8_t green, uint8_t blue) {
@@ -850,27 +916,26 @@ int main() {
     lv_label_set_text(v_label, "200 px");
     lv_obj_align_to(v_label, v_rule, LV_ALIGN_OUT_RIGHT_MID, 12, 0);
 
-    touch_crosshair_h = lv_obj_create(screen);
-    lv_obj_remove_style_all(touch_crosshair_h);
-    lv_obj_set_size(touch_crosshair_h, 28, 3);
-    lv_obj_set_style_bg_color(touch_crosshair_h, lv_color_hex(0xFF4040), 0);
-    lv_obj_set_style_bg_opa(touch_crosshair_h, LV_OPA_COVER, 0);
-    lv_obj_add_flag(touch_crosshair_h, LV_OBJ_FLAG_HIDDEN);
+    for (int slot_index = 0; slot_index < kMaxTouchSlots; slot_index++) {
+        touch_crosshair_h[slot_index] = lv_obj_create(screen);
+        lv_obj_remove_style_all(touch_crosshair_h[slot_index]);
+        lv_obj_set_size(touch_crosshair_h[slot_index], 28, 3);
+        lv_obj_set_style_bg_opa(touch_crosshair_h[slot_index], LV_OPA_COVER, 0);
+        lv_obj_add_flag(touch_crosshair_h[slot_index], LV_OBJ_FLAG_HIDDEN);
 
-    touch_crosshair_v = lv_obj_create(screen);
-    lv_obj_remove_style_all(touch_crosshair_v);
-    lv_obj_set_size(touch_crosshair_v, 3, 28);
-    lv_obj_set_style_bg_color(touch_crosshair_v, lv_color_hex(0xFF4040), 0);
-    lv_obj_set_style_bg_opa(touch_crosshair_v, LV_OPA_COVER, 0);
-    lv_obj_add_flag(touch_crosshair_v, LV_OBJ_FLAG_HIDDEN);
+        touch_crosshair_v[slot_index] = lv_obj_create(screen);
+        lv_obj_remove_style_all(touch_crosshair_v[slot_index]);
+        lv_obj_set_size(touch_crosshair_v[slot_index], 3, 28);
+        lv_obj_set_style_bg_opa(touch_crosshair_v[slot_index], LV_OPA_COVER, 0);
+        lv_obj_add_flag(touch_crosshair_v[slot_index], LV_OBJ_FLAG_HIDDEN);
 
-    touch_crosshair_dot = lv_obj_create(screen);
-    lv_obj_remove_style_all(touch_crosshair_dot);
-    lv_obj_set_size(touch_crosshair_dot, 7, 7);
-    lv_obj_set_style_radius(touch_crosshair_dot, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(touch_crosshair_dot, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_bg_opa(touch_crosshair_dot, LV_OPA_COVER, 0);
-    lv_obj_add_flag(touch_crosshair_dot, LV_OBJ_FLAG_HIDDEN);
+        touch_crosshair_dot[slot_index] = lv_obj_create(screen);
+        lv_obj_remove_style_all(touch_crosshair_dot[slot_index]);
+        lv_obj_set_size(touch_crosshair_dot[slot_index], 7, 7);
+        lv_obj_set_style_radius(touch_crosshair_dot[slot_index], LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_opa(touch_crosshair_dot[slot_index], LV_OPA_COVER, 0);
+        lv_obj_add_flag(touch_crosshair_dot[slot_index], LV_OBJ_FLAG_HIDDEN);
+    }
 
     auto last_tick = std::chrono::steady_clock::now();
 
