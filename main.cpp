@@ -56,6 +56,9 @@ static volatile std::sig_atomic_t exit_requested = 0;
 static uint32_t logical_scr_w = 0;
 static uint32_t logical_scr_h = 0;
 static lv_obj_t *root_screen = nullptr;
+static lv_obj_t *touch_crosshair_h = nullptr;
+static lv_obj_t *touch_crosshair_v = nullptr;
+static lv_obj_t *touch_crosshair_dot = nullptr;
 static bool bg_pressed_visual = false;
 
 struct Touchscreen {
@@ -561,6 +564,7 @@ static void touch_poll() {
 static void touch_read(lv_indev_t *, lv_indev_data_t *data) {
     data->state = ts.pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
 
+    lv_point_t point {};
     if (ts.has_x && ts.has_y) {
         int physical_x = scale_touch_axis(ts.raw_x, ts.min_x, ts.max_x, static_cast<int>(fb.width) - 1, ts.invert_x);
         int physical_y = scale_touch_axis(ts.raw_y, ts.min_y, ts.max_y, static_cast<int>(fb.height) - 1, ts.invert_y);
@@ -571,12 +575,58 @@ static void touch_read(lv_indev_t *, lv_indev_data_t *data) {
             physical_y = tmp;
         }
 
-        data->point.x = static_cast<lv_coord_t>((static_cast<int64_t>(physical_x) * logical_scr_w) / fb.width);
-        data->point.y = static_cast<lv_coord_t>((static_cast<int64_t>(physical_y) * logical_scr_h) / fb.height);
+        point.x = static_cast<lv_coord_t>((static_cast<int64_t>(physical_x) * logical_scr_w) / fb.width);
+        point.y = static_cast<lv_coord_t>((static_cast<int64_t>(physical_y) * logical_scr_h) / fb.height);
+        data->point = point;
     } else {
         data->point.x = 0;
         data->point.y = 0;
     }
+}
+
+static bool touch_get_logical_point(lv_point_t *point) {
+    if (!point || !ts.pressed || !ts.has_x || !ts.has_y) {
+        return false;
+    }
+
+    int physical_x = scale_touch_axis(ts.raw_x, ts.min_x, ts.max_x, static_cast<int>(fb.width) - 1, ts.invert_x);
+    int physical_y = scale_touch_axis(ts.raw_y, ts.min_y, ts.max_y, static_cast<int>(fb.height) - 1, ts.invert_y);
+
+    if (ts.swap_xy) {
+        const int tmp = physical_x;
+        physical_x = physical_y;
+        physical_y = tmp;
+    }
+
+    point->x = static_cast<lv_coord_t>((static_cast<int64_t>(physical_x) * logical_scr_w) / fb.width);
+    point->y = static_cast<lv_coord_t>((static_cast<int64_t>(physical_y) * logical_scr_h) / fb.height);
+    return true;
+}
+
+static void update_touch_crosshair() {
+    if (!touch_crosshair_h || !touch_crosshair_v || !touch_crosshair_dot) {
+        return;
+    }
+
+    lv_point_t point {};
+    if (!touch_get_logical_point(&point)) {
+        lv_obj_add_flag(touch_crosshair_h, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(touch_crosshair_v, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(touch_crosshair_dot, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    static constexpr lv_coord_t crosshair_span = 28;
+    static constexpr lv_coord_t crosshair_thickness = 3;
+    static constexpr lv_coord_t dot_size = 7;
+
+    lv_obj_clear_flag(touch_crosshair_h, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(touch_crosshair_v, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(touch_crosshair_dot, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_set_pos(touch_crosshair_h, point.x - (crosshair_span / 2), point.y - (crosshair_thickness / 2));
+    lv_obj_set_pos(touch_crosshair_v, point.x - (crosshair_thickness / 2), point.y - (crosshair_span / 2));
+    lv_obj_set_pos(touch_crosshair_dot, point.x - (dot_size / 2), point.y - (dot_size / 2));
 }
 
 static uint32_t pack_fb_pixel(uint8_t red, uint8_t green, uint8_t blue) {
@@ -799,12 +849,35 @@ int main() {
     lv_label_set_text(v_label, "200 px");
     lv_obj_align_to(v_label, v_rule, LV_ALIGN_OUT_RIGHT_MID, 12, 0);
 
+    touch_crosshair_h = lv_obj_create(screen);
+    lv_obj_remove_style_all(touch_crosshair_h);
+    lv_obj_set_size(touch_crosshair_h, 28, 3);
+    lv_obj_set_style_bg_color(touch_crosshair_h, lv_color_hex(0xFF4040), 0);
+    lv_obj_set_style_bg_opa(touch_crosshair_h, LV_OPA_COVER, 0);
+    lv_obj_add_flag(touch_crosshair_h, LV_OBJ_FLAG_HIDDEN);
+
+    touch_crosshair_v = lv_obj_create(screen);
+    lv_obj_remove_style_all(touch_crosshair_v);
+    lv_obj_set_size(touch_crosshair_v, 3, 28);
+    lv_obj_set_style_bg_color(touch_crosshair_v, lv_color_hex(0xFF4040), 0);
+    lv_obj_set_style_bg_opa(touch_crosshair_v, LV_OPA_COVER, 0);
+    lv_obj_add_flag(touch_crosshair_v, LV_OBJ_FLAG_HIDDEN);
+
+    touch_crosshair_dot = lv_obj_create(screen);
+    lv_obj_remove_style_all(touch_crosshair_dot);
+    lv_obj_set_size(touch_crosshair_dot, 7, 7);
+    lv_obj_set_style_radius(touch_crosshair_dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(touch_crosshair_dot, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(touch_crosshair_dot, LV_OPA_COVER, 0);
+    lv_obj_add_flag(touch_crosshair_dot, LV_OBJ_FLAG_HIDDEN);
+
     auto last_tick = std::chrono::steady_clock::now();
 
     while (!exit_requested) {
         handle_debug_input();
         touch_poll();
         sync_touch_visual();
+        update_touch_crosshair();
 
         const auto now = std::chrono::steady_clock::now();
         const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_tick).count();
