@@ -680,10 +680,11 @@ static void fb_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
     const bool is_last_flush = lv_display_flush_is_last(disp);
     const int fb_bytes_per_pixel = 4;
     const auto *src = reinterpret_cast<const uint16_t *>(px_map);
-    const int dst_x1 = logical_x_to_physical(area->x1);
-    const int dst_x2 = logical_x_to_physical(area->x2 + 1) - 1;
-    const int dst_y1 = logical_y_to_physical(area->y1);
-    const int dst_y2 = logical_y_to_physical(area->y2 + 1) - 1;
+    static constexpr int flush_margin_px = 1;
+    const int dst_x1 = LV_MAX(0, logical_x_to_physical(area->x1) - flush_margin_px);
+    const int dst_x2 = LV_MIN(static_cast<int>(fb.width) - 1, logical_x_to_physical(area->x2 + 1) - 1 + flush_margin_px);
+    const int dst_y1 = LV_MAX(0, logical_y_to_physical(area->y1) - flush_margin_px);
+    const int dst_y2 = LV_MIN(static_cast<int>(fb.height) - 1, logical_y_to_physical(area->y2 + 1) - 1 + flush_margin_px);
 
     if (dst_x1 > dst_x2 || dst_y1 > dst_y2) {
         lv_display_flush_ready(disp);
