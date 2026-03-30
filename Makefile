@@ -3,8 +3,11 @@ CC := gcc
 
 DRM_CFLAGS := $(shell pkg-config --cflags libdrm)
 DRM_LIBS := $(shell pkg-config --libs libdrm)
+LVGL_DIR ?= ../src/lvgl
+LVGL_DIR := $(abspath $(LVGL_DIR))
+LVGL_PARENT := $(abspath $(LVGL_DIR)/..)
 
-COMMONFLAGS := -O2 -Wall -Wextra -I/root/src/ -I/root/speedometer $(DRM_CFLAGS)
+COMMONFLAGS := -O2 -Wall -Wextra -I$(LVGL_PARENT) -I$(CURDIR) $(DRM_CFLAGS)
 CXXFLAGS := -std=c++17 $(COMMONFLAGS)
 CFLAGS := -std=gnu11 $(COMMONFLAGS)
 LDLIBS := -lpthread -lm $(DRM_LIBS)
@@ -21,7 +24,11 @@ OBJ := $(MAIN_OBJ) $(LVGL_OBJ)
 
 .PHONY: all clean run compdb
 
-all: $(TARGET)
+all: check-lvgl $(TARGET)
+
+check-lvgl:
+	test -f "$(LVGL_DIR)/lvgl.h"
+	test -d "$(LVGL_DIR)/src"
 
 $(TARGET): $(OBJ)
 	$(CXX) -o $@ $(OBJ) $(LDLIBS)
@@ -37,7 +44,7 @@ $(BUILD_DIR)/lvgl/%.o: $(LVGL_DIR)/src/%.c
 run: $(TARGET)
 	./$(TARGET)
 
-compile_commands.json: Makefile
+compile_commands.json: Makefile check-lvgl
 	printf '[\n' > $@
 	first=1; \
 	main_cmd='$(CXX) $(CXXFLAGS) -c $(SRC) -o $(MAIN_OBJ)'; \
