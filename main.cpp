@@ -1,5 +1,6 @@
 #include <fcntl.h>
 #include <linux/fb.h>
+#include <linux/input.h>
 #include <signal.h>
 #include <sys/kd.h>
 #include <sys/ioctl.h>
@@ -36,6 +37,26 @@ static bool old_termios_valid = false;
 static volatile std::sig_atomic_t exit_requested = 0;
 static uint32_t logical_scr_w = 0;
 static uint32_t logical_scr_h = 0;
+static lv_obj_t *root_screen = nullptr;
+static bool bg_pressed_visual = false;
+
+struct Touchscreen {
+    int fd = -1;
+    int min_x = 0;
+    int max_x = 4095;
+    int min_y = 0;
+    int max_y = 4095;
+    int raw_x = 0;
+    int raw_y = 0;
+    bool pressed = false;
+    bool has_x = false;
+    bool has_y = false;
+    bool invert_x = false;
+    bool invert_y = false;
+    bool swap_xy = false;
+};
+
+static Touchscreen ts;
 
 /*
  * Final fine-tune after fixing the HDMI/Linux mode handoff. With the
@@ -103,6 +124,40 @@ static bool vt_enter_graphics(const char *tty = "/dev/tty1") {
     }
 
     return true;
+}
+
+static bool touch_init(const char *dev = "/dev/input/event0") {
+    ts.fd = open(dev, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (ts.fd < 0) {
+        std::perror("open touch input");
+        return false;
+    }
+
+    input_absinfo absinfo {};
+    if (ioctl(ts.fd, EVIOCGABS(ABS_X), &absinfo) == 0) {
+        ts.min_x = absinfo.minimum;
+        ts.max_x = absinfo.maximum;
+    } else if (ioctl(ts.fd, EVIOCGABS(ABS_MT_POSITION_X), &absinfo) == 0) {
+        ts.min_x = absinfo.minimum;
+        ts.max_x = absinfo.maximum;
+    }
+
+    if (ioctl(ts.fd, EVIOCGABS(ABS_Y), &absinfo) == 0) {
+        ts.min_y = absinfo.minimum;
+        ts.max_y = absinfo.maximum;
+    } else if (ioctl(ts.fd, EVIOCGABS(ABS_MT_POSITION_Y), &absinfo) == 0) {
+        ts.min_y = absinfo.minimum;
+        ts.max_y = absinfo.maximum;
+    }
+
+    return true;
+}
+
+static void touch_deinit() {
+    if (ts.fd >= 0) {
+        close(ts.fd);
+        ts.fd = -1;
+    }
 }
 
 static void vt_leave_graphics() {
@@ -182,6 +237,7 @@ static void app_cleanup() {
     std::free(buf2);
     buf1 = nullptr;
     buf2 = nullptr;
+    touch_deinit();
     fb_deinit();
     vt_leave_graphics();
 }
@@ -208,6 +264,77 @@ static int logical_y_to_physical(int logical_y) {
 
 static int physical_y_to_logical(int physical_y) {
     return static_cast<int>(((static_cast<int64_t>(physical_y) * logical_scr_h) + (fb.vinfo.yres / 2)) / fb.vinfo.yres);
+}
+
+static int scale_touch_axis(int value, int min_value, int max_value, int out_max, bool invert_axis) {
+    if (max_value <= min_value) {
+        return 0;
+    }
+
+    int64_t scaled = (static_cast<int64_t>(value - min_value) * out_max) / (max_value - min_value);
+    if (scaled < 0) {
+        scaled = 0;
+    }
+    if (scaled > out_max) {
+        scaled = out_max;
+    }
+
+    int result = static_cast<int>(scaled);
+    if (invert_axis) {
+        result = out_max - result;
+    }
+    return result;
+}
+
+static void touch_poll() {
+    if (ts.fd < 0) {
+        return;
+    }
+
+    input_event ev {};
+    while (read(ts.fd, &ev, sizeof(ev)) == static_cast<ssize_t>(sizeof(ev))) {
+        if (ev.type == EV_KEY && ev.code == BTN_TOUCH) {
+            ts.pressed = (ev.value != 0);
+        } else if (ev.type == EV_ABS) {
+            switch (ev.code) {
+            case ABS_X:
+            case ABS_MT_POSITION_X:
+                ts.raw_x = ev.value;
+                ts.has_x = true;
+                break;
+            case ABS_Y:
+            case ABS_MT_POSITION_Y:
+                ts.raw_y = ev.value;
+                ts.has_y = true;
+                break;
+            default:
+                break;
+            }
+        }
+    }
+}
+
+static void touch_read(lv_indev_t *, lv_indev_data_t *data) {
+    touch_poll();
+
+    data->state = ts.pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+
+    if (ts.has_x && ts.has_y) {
+        int physical_x = scale_touch_axis(ts.raw_x, ts.min_x, ts.max_x, static_cast<int>(fb.vinfo.xres) - 1, ts.invert_x);
+        int physical_y = scale_touch_axis(ts.raw_y, ts.min_y, ts.max_y, static_cast<int>(fb.vinfo.yres) - 1, ts.invert_y);
+
+        if (ts.swap_xy) {
+            const int tmp = physical_x;
+            physical_x = physical_y;
+            physical_y = tmp;
+        }
+
+        data->point.x = static_cast<lv_coord_t>((static_cast<int64_t>(physical_x) * logical_scr_w) / fb.vinfo.xres);
+        data->point.y = static_cast<lv_coord_t>((static_cast<int64_t>(physical_y) * logical_scr_h) / fb.vinfo.yres);
+    } else {
+        data->point.x = 0;
+        data->point.y = 0;
+    }
 }
 
 static uint32_t scale_8bit_to_channel(uint8_t value, uint32_t bits) {
@@ -354,7 +481,15 @@ int main() {
     lv_display_set_flush_cb(display, fb_flush);
     lv_display_set_buffers(display, buf1, buf2, buf_size, LV_DISPLAY_RENDER_MODE_PARTIAL);
 
+    if (touch_init()) {
+        lv_indev_t *touch_indev = lv_indev_create();
+        lv_indev_set_type(touch_indev, LV_INDEV_TYPE_POINTER);
+        lv_indev_set_read_cb(touch_indev, touch_read);
+        lv_indev_set_display(touch_indev, display);
+    }
+
     lv_obj_t *screen = lv_scr_act();
+    root_screen = screen;
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
 
@@ -438,6 +573,12 @@ int main() {
         handle_debug_input();
         lv_tick_inc(10);
         lv_timer_handler();
+
+        if (root_screen && bg_pressed_visual != ts.pressed) {
+            bg_pressed_visual = ts.pressed;
+            lv_obj_set_style_bg_color(root_screen, bg_pressed_visual ? lv_color_hex(0x404060) : lv_color_hex(0x000000), 0);
+        }
+
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
